@@ -1,9 +1,10 @@
 from typing import List, Optional
 import asyncio
 from enum import Enum
+from io import BytesIO, StringIO
 
 from aiocache import caches
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from pydantic import BaseModel, HttpUrl
 import geocoder
 import pandas
@@ -97,7 +98,7 @@ async def resolve_precinct(resolved_addresses: List[ResolvedAddress], precinct_m
                             resolved_address=row.resolved_address, 
                             lat=row.lat, 
                             lng=row.lng, 
-                            precinct=int(row[precinct_field_name]) or 0)
+                            precinct=0 if pandas.isna(row[precinct_field_name]) else int(row[precinct_field_name]))
             for _, row in joined_df.iterrows()]
 
 @app.get("/geocode", response_model=ResolvedAddress)
@@ -107,22 +108,31 @@ async def geocode(address: str, coder_service: MapService, coder_key: str, preci
     return (await resolve_precinct([ra], precinct_map_url, precinct_field_name))[0]
 
 @app.post("/geocode", response_model=List[ResolvedAddress])
-async def geocode_csv(addresses: str, coder_service: MapService, coder_key: str, precinct_map_url: HttpUrl, precinct_field_name: str):
-    with open('addresses.csv', 'w') as f:
-        first_char = f.read(1)
-        f.seek(0)
-        if first_char in '{[':
-            df = pandas.read_json(f)
+async def geocode_csv(addresses: UploadFile, coder_service: MapService, coder_key: str, precinct_map_url: HttpUrl, precinct_field_name: str, address_field_name: str = "address"):
+    first_char = (await addresses.read(1)).decode("utf-8")
+    await addresses.seek(0)
+    logger.debug("First character of file: {}".format(first_char))
+    if first_char in '{[':
+        df = pandas.read_json(addresses.file)
+    try:
+        df = pandas.read_csv(
+                StringIO(str(addresses.file.read(), 'utf-8')), encoding='utf-8')
+    except (UnicodeDecodeError, ValueError) as e:
+        logger.debug("Error reading CSV file: {}".format(e))
+        logger.debug("Trying to read as Excel file")
+        # rewind because we're at the end of the file here
+        await addresses.seek(0)
         try:
-            df = pandas.read_csv(f)
-        except ValueError:
-            try:
-                df = pandas.read_excel(f)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Input file must be CSV, JSON, or Excel")
-    
-    if 'address' not in df.columns:
-        raise HTTPException(status_code=400, detail="No 'address' column in input file")
+            df = pandas.read_excel(BytesIO(addresses.file.read()), engine='openpyxl')
+        except ValueError as e:
+            logger.debug("Error reading Excel file: {}".format(e))
+            raise HTTPException(status_code=400, detail="Input file must be CSV, JSON, or Excel")
+
+    if not all([(fn in df.columns) for fn in address_field_name.split()]):
+        if address_field_name == "address":
+            raise HTTPException(status_code=400, detail="Input file must contain an 'address' column, or you must specify the address_field_name parameter")
+        else:
+            raise HTTPException(status_code=400, detail="Specified address_field_name(s) '{}' not found in input file".format(address_field_name))
     with requests.Session() as session:
-        resolved_addresses = await asyncio.gather(*[_geocode(address, coder_service=coder_service, coder_key=coder_key, session=session) for address in df['address']])
+        resolved_addresses = await asyncio.gather(*[_geocode(address, coder_service=coder_service, coder_key=coder_key, session=session) for address in df[address_field_name.split()].apply(lambda x: " ".join(x.map(str)), axis=1)])
     return await resolve_precinct(resolved_addresses, precinct_map_url, precinct_field_name)
