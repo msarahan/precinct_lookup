@@ -5,7 +5,7 @@ services:
     restart: always
     ports:
       - '6379:6379'
-    command: redis-server --save 20 1 --loglevel warning --requirepass IamNotAGreatPassword.
+    command: redis-server --save 20 1 --loglevel warning --requirepass $REDIS_PASSWORD
     volumes: 
       - cache:/data
   api:
@@ -13,17 +13,7 @@ services:
     restart: always
     ports:
       - '8000:80'
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_PASSWORD=IamNotAGreatPassword.
-      # optional - you may set these so that you don't have to provide them on every request
-      #      BE CAREFUL TO NOT COMMIT YOUR GEOCODER KEY!
-      # - GEOCODER_KEY=your_key
-      # - GEOCODER_PROVIDER=google
-      # - PRECINCT_MAP_URL=https://your_precinct_map_url 
-      # - PRECINCT_FIELD_NAME=PREC
-      # - ADDRESS_FIELD_NAME=address
+    env_file: .env
     depends_on:
       - redis
     volumes:
