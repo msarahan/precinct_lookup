@@ -1,5 +1,5 @@
 from copyreg import pickle
-from tempfile import TemporaryDirectory, tempdir
+from tempfile import TemporaryDirectory
 from typing import List, Optional
 import asyncio
 from enum import Enum
@@ -48,7 +48,7 @@ class ResolvedAddress(BaseModel):
     lat: Optional[float]
     lng: Optional[float]
     precinct: Optional[int] 
-    index_number: Optional[int]
+    original_index: Optional[int]
 
 class MapService(str, Enum):
     mapquest = "mapquest"
@@ -62,21 +62,18 @@ def get_redis_cache():
         f"redis://{REDIS_HOST}:{REDIS_PORT}", password=REDIS_PASSWORD,
     )
 
-async def _geocode(address: str, coder_service: MapService, coder_key: str, session: requests.Session, index_number:int = 0):
+async def _geocode(address: str, coder_service: MapService, coder_key: str, session: requests.Session, original_index:int = 0):
     cache = get_redis_cache()
     if await cache.exists(address):
         logger.debug("Cache hit for address: {}".format(address))
         return pickle.loads(await cache.get(address))
-    ra = ResolvedAddress(address=address, index_number=index_number)
     logger.info("Cache miss: Geocoding address: {}".format(address))
     result = getattr(geocoder, coder_service)(address, key=coder_key, session=session)
     if result.ok:
-        ra.resolved_address = result.address
-        ra.lat, ra.lng = result.latlng
-        await cache.set(address, pickle.dumps(ra))
+        await cache.set(address, pickle.dumps(result.latlng))
     else:
         logger.warning("Geocoder failed to resolve address: {}".format(address))
-    return ra
+    return result.latlng[0], result.latlng[1]
 
 async def load_precinct_map(precinct_map_url):
     cache = get_redis_cache()
@@ -95,23 +92,23 @@ def df_to_return_struct(df, precinct_field_name):
                             lat=float(row.lat) if row["lat"] else None, 
                             lng=float(row.lng) if row["lng"] else None, 
                             precinct=int(row[precinct_field_name]) if row[precinct_field_name] else None,
-                            index_number=row.index_number
-                            )
+                            original_index=row.original_index)
             for _, row in df.iterrows() if row["address"]]
 
-async def resolve_precinct(resolved_addresses: List[ResolvedAddress], precinct_map_url: HttpUrl, precinct_field_name: str):
-    df = pandas.DataFrame([ra.dict() for ra in resolved_addresses])
-    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lng, df.lat, crs="EPSG:4326"))
+async def resolve_precinct(resolved_addresses: pandas.DataFrame, precinct_map_url: HttpUrl, precinct_field_name: str):
+    gdf = gpd.GeoDataFrame(resolved_addresses, geometry=gpd.points_from_xy(resolved_addresses.lng, resolved_addresses.lat, crs="EPSG:4326"))
 
     logger.info("Resolving precincts for {} addresses".format(len(gdf)))
     precinct_map = await load_precinct_map(precinct_map_url)
     logger.debug("Precinct map columns: \n{}".format(precinct_map.columns))
-    column_subset = list(df.columns) + [precinct_field_name]
+    column_subset = list(resolved_addresses.columns) + [precinct_field_name]
     try:
         joined_df = gpd.sjoin(gdf, precinct_map.to_crs("EPSG:4326"), how="left", op="within")[column_subset]
     except KeyError:
         raise HTTPException(status_code=400, detail="Precinct field name not found in precinct map shapefile. Available fields are: {}".format(precinct_map.columns))
-    return joined_df
+    resolved_addresses["precinct"] = joined_df[precinct_field_name]
+    resolved_addresses.drop(columns=["geometry", "lat", "lng", "internal_composite_address"], inplace=True)
+    # no return; inplace update
 
 @app.get("/geocode", response_model=ResolvedAddress)
 async def geocode(address: str, coder_service: Optional[MapService] = MapService.google, coder_key: Optional[str] = None, precinct_map_url: Optional[HttpUrl] = None, precinct_field_name: Optional[str] = None):
@@ -126,17 +123,20 @@ async def geocode(address: str, coder_service: Optional[MapService] = MapService
     if not precinct_field_name:
         raise HTTPException(status_code=400, detail="No precinct field name provided")
     with requests.Session() as session:
-        ra = await _geocode(address, coder_service, coder_key, session, index_number=1)
-    df = await resolve_precinct([ra], precinct_map_url, precinct_field_name)
+        latlng = await _geocode(address, coder_service, coder_key, session, original_index=1)
+    df = pandas.DataFrame([{"address": address, "lat": latlng[0], "lng": latlng[1], "original_index": 1}])
+    # in-place modification of df
+    await resolve_precinct(df, precinct_map_url, precinct_field_name)
     return (df_to_return_struct(df, precinct_field_name))[0]
 
 def compose_address_column_and_filter_empty(df, address_columns_str):
-    # store the original index number so we can reassemble things later without any more complicated matching logic
-    df["index_number"] = range(1, len(df) + 1)
     columns = address_columns_str.split(" ")
-    df.dropna(subset=columns, inplace=True, how="all")
-    df["internal_composite_address"] = df[columns].apply(lambda x: " ".join(x.map(str)), axis=1)
-    return df
+    only_entries_with_address = df.dropna(subset=columns, how="all")
+    df_columns = df.columns
+    only_entries_with_address["internal_composite_address"] = df[columns].apply(lambda x: " ".join(x.map(str)), axis=1)
+    only_entries_with_address.drop(columns=[col for col in df_columns], inplace=True)
+    # this is a collection of addresses that retains the original index numeric values
+    return only_entries_with_address
 
 async def read_file(addresses_upload_file):
     first_char = (await addresses_upload_file.read(1)).decode("utf-8")
@@ -176,7 +176,6 @@ async def _geocode_many(addresses: UploadFile, coder_service: Optional[MapServic
     address_field_name = address_field_name or os.environ.get("ADDRESS_FIELD_NAME") or "address"
 
     df, file_type = await read_file(addresses)
-
     if not all([(fn in df.columns) for fn in address_field_name.split()]):
         if address_field_name == "address":
             raise HTTPException(status_code=400, detail="Input file must contain an 'address' column, or you must specify the address_field_name parameter")
@@ -184,14 +183,13 @@ async def _geocode_many(addresses: UploadFile, coder_service: Optional[MapServic
             raise HTTPException(status_code=400, detail="Specified address_field_name(s) '{}' not found in input file".format(address_field_name))
     filtered_df = compose_address_column_and_filter_empty(df, address_field_name)
     with requests.Session() as session:
-        resolved_addresses = await asyncio.gather(*[_geocode(address, coder_service=coder_service, coder_key=coder_key, session=session, index_number=index_number) 
-            for index_number, address in filtered_df[["index_number", "internal_composite_address"]].to_records(index=False)])
+        filtered_df[["lat", "lng"]] = await asyncio.gather(*[_geocode(address, coder_service=coder_service, coder_key=coder_key, session=session) 
+            for address in filtered_df.internal_composite_address])
+    await resolve_precinct(filtered_df, precinct_map_url, precinct_field_name) 
+    logger.debug("Filtered df head: {}".format(filtered_df.head()))
     # join the filtered data that has addresses with the removed data that doesn't to restore
     # the original table
-    precinct_df = await resolve_precinct(resolved_addresses, precinct_map_url, precinct_field_name) 
-    merged_df = df.merge(precinct_df, on="index_number", how="left")
-    merged_df = merged_df.drop(["geometry", "internal_composite_address"], axis=1)
-    merged_df = merged_df.fillna("")
+    merged_df = df.join(filtered_df, how="left")
     logger.debug("Merged dataframe rows: {}".format(len(merged_df)))
     logger.debug("Merged dataframe head: \n{}".format(merged_df.head()))
     return merged_df, file_type
@@ -211,19 +209,27 @@ async def get_temp_dir():
 @app.post("/augment", response_class=FileResponse)
 async def geocode_augment_csv(addresses: UploadFile, coder_service: Optional[MapService] = MapService.google, coder_key: Optional[str] = None, precinct_map_url: Optional[HttpUrl] = None, precinct_field_name: Optional[str] = None, address_field_name: Optional[str] = None, _dir=Depends(get_temp_dir)):
     merged_df, file_type = await _geocode_many(addresses, coder_service, coder_key, precinct_map_url, precinct_field_name, address_field_name)
-    fn = "-plus_precincts".join(os.path.splitext(addresses.filename))
+    fn = os.path.splitext(addresses.filename)[0] + "-plus_precincts.csv"
     fpath = os.path.join(_dir, fn)
-    if file_type == "csv":
-        merged_df.to_csv(fpath, index=False)
-        return FileResponse(fpath, filename=fn)
-    elif file_type == "json":
-        merged_df.to_json(fpath, index=False)
-        return FileResponse(fpath, filename=fn)
-    elif file_type == "excel":
-        merged_df.to_excel(fpath, index=False)
-        return FileResponse(fpath, filename=fn)
-    else:
-        raise HTTPException(status_code=400, detail="unknown file type, can't augment this")
+    #if file_type == "csv":
+    merged_df.to_csv(fpath, index=False)
+    return FileResponse(fpath, filename=fn)
+    # TODO: support Excel export. Right now, the files being served are not valid xlsx files and I'm not sure why.
+    # elif file_type == "json":
+    #     merged_df.to_json(fpath, index=False)
+    #     return FileResponse(fpath, filename=fn)
+    # elif file_type == "excel":
+    #     options = {
+    #         "strings_to_urls": False, 
+    #         "strings_to_formulas": False,
+    #         "nan_inf_to_errors": True,
+    #         }
+    #     writer = pandas.ExcelWriter(fpath,engine='xlsxwriter',options=options)
+    #     merged_df.to_excel(writer, index=False)
+    #     writer.save()
+    #     return FileResponse(fpath, filename=fn)
+    # else:
+    #     raise HTTPException(status_code=400, detail="unknown file type, can't augment this")
     
     
     
